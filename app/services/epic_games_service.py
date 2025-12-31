@@ -63,50 +63,34 @@ def get_promotions() -> List[PromotionGame]:
             continue
 
         # -----------------------------------------------------------
-        # 🟢 修复 V2 (增强版)：多维度检测 Bundle (Trine 修复)
+        # 🟢 智能 URL 识别逻辑
         # -----------------------------------------------------------
-        
-        # 1. 调试：如果遇到 Trine，打印原始数据以便分析
-        if "Trine" in e.get("title", ""):
-            logger.debug(f"🔍 Inspecting Game Data: {e.get('title')} | offerType: {e.get('offerType')}")
-
         is_bundle = False
-        
-        # 判定 A: 检查 offerType
         if e.get("offerType") == "BUNDLE":
             is_bundle = True
         
-        # 判定 B: 检查 categories (分类路径)
+        # 补充检测：分类和标题
         if not is_bundle:
             for cat in e.get("categories", []):
                 if "bundle" in cat.get("path", "").lower():
                     is_bundle = True
-                    logger.debug(f"📦 Detected Bundle via Category: {e.get('title')}")
                     break
-
-        # 判定 C: 标题关键字兜底 (Trine Classic Collection 必定中招)
         if not is_bundle and "Collection" in e.get("title", ""):
              is_bundle = True
-             logger.debug(f"📦 Detected Bundle via Title keyword: {e.get('title')}")
 
-        # 根据判定结果选择 Base URL
         base_url = URL_PRODUCT_BUNDLES if is_bundle else URL_PRODUCT_PAGE
 
         try:
-            # 优先使用 offerMappings 中的 pageSlug
             if e.get('offerMappings'):
                 slug = e['offerMappings'][0]['pageSlug']
                 e["url"] = f"{base_url.rstrip('/')}/{slug}"
-            # 兜底使用 productSlug
             elif e.get("productSlug"):
                 e["url"] = f"{base_url.rstrip('/')}/{e['productSlug']}"
             else:
-                # 最后的救命稻草：urlSlug
                  e["url"] = f"{base_url.rstrip('/')}/{e.get('urlSlug', 'unknown')}"
         except (KeyError, IndexError):
             logger.info(f"Failed to get URL: {e}")
             continue
-        # -----------------------------------------------------------
 
         logger.info(e["url"])
         promotions.append(PromotionGame(**e))
@@ -239,7 +223,6 @@ class EpicGames:
                 return True
 
     async def _handle_instant_checkout(self, page: Page):
-        """处理点击 'Get' 后弹出的即时结账窗口 (容错增强版)"""
         logger.info("🚀 Triggering Instant Checkout Flow...")
         agent = AgentV(page=page, agent_config=settings)
 
@@ -263,7 +246,6 @@ class EpicGames:
                 logger.success("🎉 Instant Checkout: Iframe closed (Success inferred)")
                 return
 
-            logger.warning("⚠️ Payment button still visible. Attempting one last click...")
             with suppress(Exception):
                 await payment_btn.click(force=True)
                 await page.wait_for_timeout(2000)
@@ -280,72 +262,71 @@ class EpicGames:
         for url in urls:
             await page.goto(url, wait_until="load")
 
-            # 🟢 增加 404 检测
+            # 404 检测
             title = await page.title()
             if "404" in title or "Page Not Found" in title:
-                logger.error(f"❌ Invalid URL (404 Page): {url} - Possible Bundle/URL mismatch.")
+                logger.error(f"❌ Invalid URL (404 Page): {url}")
                 continue
 
-            # 1. 处理弹窗
+            # 处理年龄限制弹窗
             try:
                 continue_btn = page.locator("//button//span[text()='Continue']")
                 if await continue_btn.is_visible(timeout=5000):
-                    logger.debug("Found Content Warning, clicking Continue...")
                     await continue_btn.click()
             except Exception:
                 pass 
 
-            # 2. 检查库状态
-            btn_list = page.locator("//aside//button")
-            try:
-                aside_btn_count = await btn_list.count()
-            except TimeoutError:
-                logger.warning(f"Failed to load game page buttons - {url=}")
-                continue
-
-            texts = ""
-            for i in range(aside_btn_count):
-                btn = btn_list.nth(i)
-                texts += await btn.text_content()
-
-            if "In Library" in texts:
-                logger.success(f"Already in the library - {url=}")
-                continue
-
-            # 3. 定位核心按钮
-            # 🟢 修复 V3：使用 .first 解决 Strict Mode 报错（页面上有2个按钮）
-            purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
+            # ------------------------------------------------------------
+            # 🔥 新思路：彻底解决按钮识别问题 (黑名单机制 + 智能点击)
+            # ------------------------------------------------------------
             
+            # 1. 尝试找到所有可能的“主按钮”
+            # Epic 按钮通常有 'purchase-cta-button' 这个 TestID
+            purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
+
+            # 2. 如果没找到主按钮，尝试找“库中”状态
             try:
-                purchase_status = await purchase_btn.text_content(timeout=5000)
-            except TimeoutError:
-                logger.warning(f"Could not find purchase button - {url=}")
+                if not await purchase_btn.is_visible(timeout=5000):
+                    # 再次检查是否在库中 (有时按钮不叫 purchase-cta，而是简单的 disabled button)
+                    all_text = await page.locator("body").text_content()
+                    if "In Library" in all_text or "Owned" in all_text:
+                         logger.success(f"Already in the library (Page Text Scan) - {url=}")
+                         continue
+                    logger.warning(f"Could not find any purchase button - {url=}")
+                    continue
+            except Exception:
+                pass
+
+            # 3. 获取按钮文字
+            btn_text = await purchase_btn.text_content()
+            if not btn_text: btn_text = ""
+            btn_text_upper = btn_text.strip().upper()
+            
+            logger.debug(f"👉 Found Button: '{btn_text}'")
+
+            # 4. 黑名单检查：只有这些情况绝对不能点
+            # 如果是 'IN LIBRARY', 'OWNED', 'UNAVAILABLE', 'COMING SOON' -> 跳过
+            if any(s in btn_text_upper for s in ["IN LIBRARY", "OWNED", "UNAVAILABLE", "COMING SOON"]):
+                logger.success(f"Game status is '{btn_text}' - Skipping.")
                 continue
 
-            if "Buy Now" in purchase_status or ("Get" not in purchase_status and "Add To Cart" not in purchase_status):
-                logger.warning(f"Not available for purchase - {url=}")
+            # 5. 白名单检查 (Add to Cart 特殊处理)
+            # 如果包含 'CART'，说明是加入购物车流程
+            if "CART" in btn_text_upper:
+                logger.debug(f"🛒 Logic: Add To Cart - {url=}")
+                await purchase_btn.click()
+                has_pending_cart_items = True
                 continue
-
-            # 4. 智能分支处理
-            try:
-                target_btn = purchase_btn 
-                text = await target_btn.text_content()
-                
-                if "Get" in text:
-                    logger.debug(f"👉 Found 'Get' button, starting instant checkout - {url=}")
-                    await target_btn.click()
-                    await self._handle_instant_checkout(page)
-                    
-                elif "Add To Cart" in text:
-                    logger.debug(f"🛒 Found 'Add To Cart' button - {url=}")
-                    await target_btn.click()
-                    with suppress(TimeoutError):
-                         await expect(target_btn).to_have_text("View In Cart", timeout=10000)
-                    has_pending_cart_items = True
-
-            except Exception as err:
-                logger.warning(f"Failed to process game - {err}")
-                continue
+            
+            # 6. 默认处理 (盲点逻辑)
+            # 只要不是黑名单，也不是购物车，统统当做 "Get/Purchase" 直接点击！
+            # 不管它写的是 'Get', 'Free', 'Purchase', 'Buy Now'，只要 API 说是免费的，我们就点！
+            logger.debug(f"⚡️ Logic: Aggressive Click (Text: {btn_text}) - {url=}")
+            await purchase_btn.click()
+            
+            # 点击后，转入即时结账流程
+            await self._handle_instant_checkout(page)
+            # ------------------------------------------------------------
 
         return has_pending_cart_items
 
